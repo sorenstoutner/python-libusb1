@@ -72,6 +72,7 @@ __all__ = [
     'USBPoller', 'USBTransfer', 'USBTransferHelper', 'EVENT_CALLBACK_SET',
     'USBEndpoint', 'USBInterfaceSetting', 'USBInterface',
     'USBConfiguration', 'DoomedTransferError', 'getVersion', 'USBError',
+    'setLogCallback', 'setLocale',
     'loadLibrary',
 ]
 # Bind libusb1 constants and libusb1.USBError to this module, so user does not
@@ -998,6 +999,7 @@ class USBDeviceHandle:
         device,
         registerFinalizer,
         unregisterFinalizer,
+        can_close_device,
     ):
         """
         You should not instanciate this class directly.
@@ -1024,6 +1026,11 @@ class USBDeviceHandle:
             self.close, # Note: static method
             context=context,
             handle=handle,
+            device=(
+                device
+                if can_close_device else
+                None
+            ),
             inflight=inflight,
             finalizer_dict=self.__finalizer_dict,
             unregisterFinalizer=functools.partial(
@@ -1047,6 +1054,7 @@ class USBDeviceHandle:
     def close( # pylint: disable=method-hidden
         context,
         handle,
+        device,
         inflight,
         finalizer_dict,
         unregisterFinalizer,
@@ -1087,6 +1095,8 @@ class USBDeviceHandle:
             for finalizer_handle, finalizer in list(finalizer_dict.items()):
                 finalizer()
                 assert finalizer_handle not in finalizer_dict
+        if device is not None:
+            device.close()
         libusb_close(handle)
         unregisterFinalizer()
 
@@ -1734,6 +1744,7 @@ class USBDevice:
     """
 
     __configuration_descriptor_list = ()
+    __device_handle = None
 
     def __init__(
         self,
@@ -1742,6 +1753,8 @@ class USBDevice:
         registerFinalizer,
         unregisterFinalizer,
         can_load_configuration,
+        can_change_refcount,
+        handle_p,
     ):
         """
         You should not instanciate this class directly.
@@ -1750,12 +1763,17 @@ class USBDevice:
         self.__context = context
         self.__finalizer_dict = finalizer_dict = {}
         self.__configuration_descriptor_list = descriptor_list = []
-        libusb1.libusb_ref_device(device_p)
+        if can_change_refcount:
+            libusb1.libusb_ref_device(device_p)
         finalizer_handle = id(self)
         self.close = weakref.finalize(
             self,
             self.close, # Note: static method
-            device_p=device_p,
+            device_p=(
+                device_p
+                if can_change_refcount else
+                None
+            ),
             finalizer_dict=finalizer_dict,
             unregisterFinalizer=functools.partial(
                 unregisterFinalizer,
@@ -1794,6 +1812,15 @@ class USBDevice:
         self.__bus_number = libusb1.libusb_get_bus_number(device_p)
         self.__port_number = libusb1.libusb_get_port_number(device_p)
         self.__device_address = libusb1.libusb_get_device_address(device_p)
+        if handle_p is not None:
+            self.__device_handle = USBDeviceHandle(
+                context=context,
+                handle=handle_p,
+                device=self,
+                registerFinalizer=self.__registerFinalizer,
+                unregisterFinalizer=self.__unregisterFinalizer,
+                can_close_device=True,
+            )
 
     def __registerFinalizer(self, handle, finalizer):
         if handle in self.__finalizer_dict:
@@ -1819,7 +1846,8 @@ class USBDevice:
             for handle, finalizer in list(finalizer_dict.items()):
                 finalizer()
                 assert handle not in finalizer_dict
-        libusb_unref_device(device_p)
+        if device_p is not None:
+            libusb_unref_device(device_p)
         while descriptor_list:
             libusb_free_config_descriptor(
                 byref_(descriptor_list.pop()),
@@ -2058,6 +2086,8 @@ class USBDevice:
         Open device.
         Returns an USBDeviceHandle instance.
         """
+        if self.__device_handle is not None:
+            return self.__device_handle
         handle = libusb1.libusb_device_handle_p()
         mayRaiseUSBError(libusb1.libusb_open(self.device_p, byref(handle)))
         return USBDeviceHandle(
@@ -2066,11 +2096,14 @@ class USBDevice:
             device=self,
             registerFinalizer=self.__registerFinalizer,
             unregisterFinalizer=self.__unregisterFinalizer,
+            can_close_device=False,
         )
 
 _zero_tv = libusb1.timeval(0, 0)
 _zero_tv_p = byref(_zero_tv)
 _null_pointer = c_void_p()
+_context_dict = weakref.WeakValueDictionary()
+_NULL_LOG_CALLBACK = libusb1.libusb_log_cb_p(0)
 
 class USBContext:
     """
@@ -2134,9 +2167,34 @@ class USBContext:
         return wrapper
     # pylint: enable=no-self-argument,protected-access
 
-    def __init__(self):
+    def __init__(
+        self,
+        log_level=None,
+        use_usbdk=False,
+        with_device_discovery=True,
+        log_callback=None,
+    ):
         """
         Create a new USB context.
+
+        log_level (LOG_LEVEL_*)
+            Sets the context's log level as soon as it is created.
+            Maybe have no effect depending on libusb's build options.
+        use_usbdk (bool)
+            Windows only.
+            Whether to use the UsbDk backend if available.
+        with_device_discovery (bool)
+            Linux only.
+            Disables device scan while initialising the library.
+            This has knowck-on effects on how devices may be opened and how
+            descriptors are accessed. For more details, see libusb1's
+            documentation.
+        log_callback ((int, bytes): None)
+            Context's log callback function.
+
+        Note: providing non-default values may cause context creation (during
+        __enter__, open, or the first context-dependent call, whichever happens
+        first) to fail if libusb is older than v1.0.27 .
         """
         # Used to prevent an exit to cause a segfault if a concurrent thread
         # is still in libusb.
@@ -2146,6 +2204,11 @@ class USBContext:
         assert not self.__context_p
         self.__hotplug_callback_dict = {}
         self.__finalizer_dict = {}
+        self.__log_level = log_level
+        self.__use_usbdk = use_usbdk
+        self.__with_device_discovery = with_device_discovery
+        self.__user_log_callback = log_callback
+        self.__log_callback_p = libusb1.libusb_log_cb_p(self.__log_callback)
 
     def __enter__(self):
         return self.open()
@@ -2180,7 +2243,35 @@ class USBContext:
         assert not self.__context_p
         loadLibrary()
         self.__libusb_handle_events = libusb1.libusb_handle_events
-        mayRaiseUSBError(libusb1.libusb_init(byref(self.__context_p)))
+        option_array = (
+            libusb1.libusb_init_option * libusb1.LIBUSB_OPTION_MAX
+        )()
+        option_count = 0
+        if self.__log_level is not None:
+            option = option_array[option_count]
+            option_count += 1
+            option.option = libusb1.LIBUSB_OPTION_LOG_LEVEL
+            option.value.ival = self.__log_level
+        if self.__use_usbdk:
+            option = option_array[option_count]
+            option_count += 1
+            option.option = libusb1.LIBUSB_OPTION_USE_USBDK
+            option.value.ival = 1
+        if not self.__with_device_discovery:
+            option = option_array[option_count]
+            option_count += 1
+            option.option = libusb1.LIBUSB_OPTION_NO_DEVICE_DISCOVERY
+            option.value.ival = 1
+        if self.__user_log_callback is not None:
+            option = option_array[option_count]
+            option_count += 1
+            option.option = libusb1.LIBUSB_OPTION_LOG_CB
+            option.value.log_cbval = self.__log_callback_p
+        mayRaiseUSBError(libusb1.libusb_init_context(
+            byref(self.__context_p),
+            option_array,
+            option_count,
+        ))
         self.__close = weakref.finalize(
             self,
             self.___close, # Note: static method
@@ -2189,7 +2280,9 @@ class USBContext:
             finalizer_dict=self.__finalizer_dict,
             libusb_exit=libusb1.libusb_exit,
             libusb_hotplug_deregister_callback=libusb1.libusb_hotplug_deregister_callback,
+            context_dict=_context_dict,
         )
+        _context_dict[self.__context_p.value] = self
         return self
 
     def close(self):
@@ -2232,6 +2325,7 @@ class USBContext:
         finalizer_dict,
         libusb_exit,
         libusb_hotplug_deregister_callback,
+        context_dict,
     ):
         while hotplug_callback_dict:
             # Duplicates hotplugDeregisterCallback logic, to avoid finalizer
@@ -2243,6 +2337,12 @@ class USBContext:
                 finalizer()
                 assert handle not in finalizer_dict
         libusb_exit(context_p)
+        try:
+            del context_dict[context_p.value]
+        except KeyError:
+            # Should not happen, but if it does it should not prevent this
+            # method from succeeding.
+            pass
         context_p.value = None
 
     @_validContext
@@ -2268,6 +2368,8 @@ class USBContext:
                         registerFinalizer=self.__registerFinalizer,
                         unregisterFinalizer=self.__unregisterFinalizer,
                         can_load_configuration=True,
+                        can_change_refcount=True,
+                        handle_p=None,
                     )
                 except USBError:
                     if not skip_on_error:
@@ -2337,6 +2439,39 @@ class USBContext:
         if result is not None:
             return result.open()
         return None
+
+    @_validContext
+    def wrapSysDevice(self, sys_device):
+        """
+        Wrap sys_device to obtain a USBDeviceHandle instance.
+
+        sys_device (file, int):
+            File or file descriptor of the sys device node to wrap.
+            You must keep this file open while the device is,
+            and are expected to close it any time after it is closed.
+
+        You may get a USBDevice instance by calling getDevice on the returned
+        value, but note that this device will be closed once the handle is.
+        """
+        if not isinstance(sys_device, int):
+            sys_device = sys_device.fileno()
+        handle_p = libusb1.libusb_device_handle_p()
+        mayRaiseUSBError(
+            libusb1.libusb_wrap_sys_device(
+                self.__context_p,
+                sys_device,
+                byref(handle_p),
+            )
+        )
+        return USBDevice(
+            context=self,
+            device_p=libusb1.libusb_get_device(handle_p),
+            registerFinalizer=self.__registerFinalizer,
+            unregisterFinalizer=self.__unregisterFinalizer,
+            can_load_configuration=True, # XXX: give the caller control ?
+            can_change_refcount=False,
+            handle_p=handle_p,
+        ).open()
 
     @_validContext
     def getPollFDList(self):
@@ -2638,6 +2773,8 @@ class USBContext:
                 # pylint: disable=undefined-variable
                 can_load_configuration=event != HOTPLUG_EVENT_DEVICE_LEFT,
                 # pylint: enable=undefined-variable
+                can_change_refcount=True,
+                handle_p=None,
             )
             unregister = bool(callback(
                 self,
@@ -2671,6 +2808,42 @@ class USBContext:
         """
         del self.__hotplug_callback_dict[handle]
         libusb1.libusb_hotplug_deregister_callback(self.__context_p, handle)
+
+    def __log_callback(self, _unused_context_p, level, value):
+        """
+        Internal log callback function, calls into the user-provided function
+        if any.
+        """
+        # XXX: check if context_p is actually us ?
+        user_log_callback = self.__user_log_callback
+        if user_log_callback is not None:
+            # XXX: catch exceptions ?
+            # How do exceptions work in callbacks ?
+            # What encoding ?
+            user_log_callback(self, level, value)
+
+    @_validContext
+    def setLogCallback(self, log_callback):
+        """
+        Change the active log callback for this context.
+
+        log_callback (None, (USBContext, int, bytes): None)
+            The function called when libusb emits log messages for the current
+            context.
+            None to disable the callback.
+        """
+        user_log_callback_was_unset = self.__user_log_callback is None
+        self.__user_log_callback = log_callback
+        if user_log_callback_was_unset != (log_callback is None):
+            libusb1.libusb_set_log_cb(
+                self.__context_p,
+                (
+                    _NULL_LOG_CALLBACK
+                    if log_callback is None else
+                    self.__log_callback_p
+                ),
+                libusb1.LIBUSB_LOG_CB_CONTEXT,
+            )
 
 del USBContext._validContext
 
@@ -2713,6 +2886,91 @@ def hasCapability(capability):
     """
     loadLibrary()
     return libusb1.libusb_has_capability(capability)
+
+class __GlobalLogCallback: # pylint: disable=too-few-public-methods
+    """
+    Singleton class keeping a reference to the global log callback function
+    so it is unregistered from libusb before the module gets garbage-collected.
+    """
+    __user_log_callback = None
+    __finalizer = None
+    __context_dict = _context_dict
+
+    def __init__(self):
+        self.__log_callback_p = libusb1.libusb_log_cb_p(self.__log_callback)
+
+    @staticmethod
+    def __close(
+        libusb_set_log_cb,
+        LIBUSB_LOG_CB_GLOBAL,
+    ):
+        libusb_set_log_cb(None, _NULL_LOG_CALLBACK, LIBUSB_LOG_CB_GLOBAL)
+
+    def __log_callback(self, context_p, level, message):
+        user_log_callback = self.__user_log_callback
+        if user_log_callback is not None:
+            if context_p:
+                try:
+                    context = self.__context_dict[context_p]
+                except KeyError:
+                    context = context_p.value
+            else:
+                context = None
+            user_log_callback(context, level, message)
+
+    def __call__(self, log_callback):
+        """
+        Set the global log callback.
+
+        log_callback (None, (USBContext or int or None, int, bytes): None)
+            A callable to set as libusb global log callback.
+            The first argument may be:
+            - a USBContext instance: the one the log message relates to
+            - an integer: happens if the USBContext object cannot be found using
+              the pointer received from libusb1
+            - None: the log message is not related to any specific context
+            None to disable the callback.
+
+        Calls loadLibrary.
+        libusb_set_log_cb will be called once more during module teardown.
+        """
+        if self.__finalizer is None:
+            # Lazy initialisation, so loadLibrary is not called as
+            # module load time.
+            loadLibrary()
+            self.__finalizer = weakref.finalize(
+                self,
+                self.__close, # Note: static method
+                libusb_set_log_cb=libusb1.libusb_set_log_cb,
+                LIBUSB_LOG_CB_GLOBAL=libusb1.LIBUSB_LOG_CB_GLOBAL,
+            )
+        user_log_callback_was_unset = self.__user_log_callback is None
+        self.__user_log_callback = log_callback
+        if user_log_callback_was_unset != (log_callback is None):
+            libusb1.libusb_set_log_cb(
+                None,
+                (
+                    _NULL_LOG_CALLBACK
+                    if log_callback is None else
+                    self.__log_callback_p
+                ),
+                libusb1.LIBUSB_LOG_CB_GLOBAL,
+            )
+setLogCallback = __GlobalLogCallback().__call__
+
+def setLocale(locale):
+    """
+    Set locale used for translatable libusb1 messages.
+
+    locale (str)
+        2 letter ISO 639-1 code, optionally followed by region and codeset.
+
+    Calls loadLibrary.
+    """
+    loadLibrary()
+    mayRaiseUSBError(
+        libusb1.libusb_setlocale(locale.encode('ascii'))
+    )
 
 class LibUSBContext(USBContext):
     """
